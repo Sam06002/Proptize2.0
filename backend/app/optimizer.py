@@ -1,16 +1,44 @@
 import re
 import json
-from typing import Dict, List, Tuple, Optional, Set, Any
+import spacy
+from typing import Dict, List, Tuple, Optional, Any, Set, Union
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from difflib import get_close_matches
-from collections import deque
-from math import exp
+from collections import defaultdict, deque, Counter
+from functools import lru_cache
 import logging
+from pathlib import Path
+import streamlit as st
+from time import perf_counter
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Precompile regex patterns
+PRICE_RE = re.compile(r'₹\d+|Rs\.?\d+|\d+/-')
+CATEGORIES = ["appetizer", "main course", "dessert", "beverage", "soup", "salad"]
+
+# Menu items and categories (moved to module level for better caching)
+MENU_ITEMS = {
+    'biryani': {'category': 'main course', 'variations': ['chicken biryani', 'veg biryani', 'mutton biryani']},
+    'paneer': {'category': 'main course', 'variations': ['paneer tikka', 'paneer butter masala', 'kadai paneer']},
+    'butter chicken': {'category': 'main course'},
+    'naan': {'category': 'bread', 'variations': ['butter naan', 'garlic naan']},
+    'gulab jamun': {'category': 'dessert'},
+    'momos': {'category': 'starter', 'variations': ['veg momos', 'chicken momos']},
+}
+
+MENU_CATEGORIES = {
+    'appetizer': ['starter', 'snack', 'finger food'],
+    'main course': ['main', 'thali', 'curry', 'gravy'],
+    'dessert': ['sweet', 'mithai'],
+    'beverage': ['drink', 'juice', 'soda', 'mocktail'],
+    'soup': ['soup', 'stew', 'broth'],
+    'salad': ['salad', 'raita'],
+    'bread': ['roti', 'naan', 'paratha', 'kulcha']
+}
 
 @dataclass
 class EntityExtraction:
@@ -19,6 +47,7 @@ class EntityExtraction:
     needs_user_input: bool = False
     suggested_correction: Optional[str] = None
     is_corrected: bool = False
+    source: str = "auto"  # 'auto', 'user', 'suggestion'
 
 @dataclass
 class OptimizationResult:
@@ -37,69 +66,393 @@ class OptimizationResult:
         result = asdict(self)
         result['timestamp'] = datetime.fromtimestamp(self.timestamp).isoformat()
         return result
+        
+    def get_missing_entities(self) -> List[str]:
+        """Return a list of missing entity names that need user input."""
+        return [k for k, v in self.entity_details.items() 
+               if v.get('needs_user_input', False) and not v.get('value')]
+
+@st.cache_resource
+def load_nlp():
+    """Load and cache the spaCy NLP model."""
+    try:
+        nlp = spacy.load("en_core_web_sm")
+        # Add custom pipeline components
+        if not nlp.has_pipe("entity_ruler"):
+            ruler = nlp.add_pipe("entity_ruler")
+            # Add custom patterns for menu items, categories, etc.
+            patterns = [
+                {"label": "MENU_ITEM", "pattern": [{"LOWER": {"IN": list(MENU_ITEMS.keys())}}]},
+                {"label": "CATEGORY", "pattern": [{"LOWER": {"IN": CATEGORIES}}]},
+            ]
+            ruler.add_patterns(patterns)
+        return nlp
+    except OSError:
+        logger.error("spaCy model 'en_core_web_sm' not found. Please install it with 'python -m spacy download en_core_web_sm'")
+        raise
+
+@st.cache_data
+def load_templates():
+    """Load and cache the prompt templates."""
+    templates_path = Path(__file__).parent / "data" / "templates.json"
+    try:
+        with open(templates_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Templates file not found at {templates_path}")
+        return {}
+
+@st.cache_data
+def load_samples():
+    """Load and cache the sample queries."""
+    samples_path = Path(__file__).parent / "data" / "samples.json"
+    try:
+        with open(samples_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"Samples file not found at {samples_path}")
+        return []
 
 class PetPoojaOptimizer:
     """
-    Optimizes natural language queries for PetPooja Agent.
+    Optimizes natural language queries for PetPooja Agent with performance optimizations.
     Handles menu management, inventory queries, analytics, and support.
+    
+    Features:
+    - Fast intent classification using keyword matching with weights
+    - Entity extraction with spaCy for accurate parsing
+    - Interactive feedback for missing information
+    - Caching for improved performance
+    - Support for multiple intents and entities
     """
     
-    def __init__(self, history_size: int = 10):
-        # In-memory storage for optimization history
-        self.optimization_history: deque[OptimizationResult] = deque(maxlen=history_size)
-        self.feedback_history: List[Dict[str, Any]] = []
+    def classify_intent(self, text: str) -> Tuple[str, float]:
+        """
+        Classify the intent of the input text using keyword matching with weights.
+        Returns a tuple of (intent, confidence_score).
+        """
+        text_lower = text.lower()
+        scores = defaultdict(float)
+        
+        # Calculate scores for each intent based on keyword matches
+        for intent, keywords in self.intent_keywords.items():
+            for keyword, weight in keywords.items():
+                if keyword in text_lower:
+                    scores[intent] += weight
+        
+        if not scores:
+            return ('unknown', 0.0)
+            
+        # Get the intent with the highest score
+        best_intent = max(scores.items(), key=lambda x: x[1])
+        max_score = best_intent[1]
+        total_score = sum(scores.values())
+        
+        # Normalize confidence score between 0 and 1
+        confidence = (max_score / total_score) if total_score > 0 else 0
+        
+        return (best_intent[0], confidence)
+    
+    def extract_entities(self, text: str, intent: str) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Extract entities from the input text based on the detected intent.
+        Returns a tuple of (entities, missing_entities).
+        """
+        doc = self.nlp(text)
+        entities = {}
+        missing_entities = []
+        
+        # Extract common entities
+        entities['price'] = self._extract_price(text)
+        entities['category'] = self._extract_category(text)
+        
+        # Intent-specific entity extraction
+        if intent == 'menu':
+            entities['item'] = self._extract_menu_item(text, doc)
+            if not entities['item']:
+                missing_entities.append('item')
+            if not entities['price']:
+                missing_entities.append('price')
+                
+        elif intent == 'inventory':
+            entities['item'] = self._extract_inventory_item(text, doc)
+            if not entities['item']:
+                missing_entities.append('item')
+                
+        elif intent == 'analytics':
+            entities['metric'] = self._extract_metric(text, doc)
+            entities['period'] = self._extract_time_period(text)
+            
+        elif intent == 'support':
+            entities['issue'] = text  # Use full text as issue description
+            
+        elif intent == 'raw_material':
+            entities['material'] = self._extract_material(text, doc)
+            if not entities['material']:
+                missing_entities.append('material')
+        
+        return entities, missing_entities
+    
+    def _extract_price(self, text: str) -> Optional[float]:
+        """Extract price from text using regex."""
+        match = self.price_re.search(text)
+        if match:
+            price_str = match.group().replace('₹', '').replace('Rs', '').replace('/', '').strip()
+            try:
+                return float(price_str)
+            except (ValueError, TypeError):
+                pass
+        return None
+    
+    def _extract_category(self, text: str) -> Optional[str]:
+        """Extract menu category from text."""
+        text_lower = text.lower()
+        for category, aliases in self.menu_categories.items():
+            if category in text_lower:
+                return category
+            for alias in aliases:
+                if alias in text_lower:
+                    return category
+        return None
+    
+    def _extract_menu_item(self, text: str, doc) -> Optional[str]:
+        """Extract menu item from text using spaCy NER and custom patterns."""
+        # Check for exact matches first
+        text_lower = text.lower()
+        for item in self.menu_items:
+            if item in text_lower:
+                return item
+                
+        # Use spaCy NER to find food items
+        for ent in doc.ents:
+            if ent.label_ == 'FOOD' or ent.label_ == 'MENU_ITEM':
+                return ent.text
+                
+        # Fallback to noun chunks
+        for chunk in doc.noun_chunks:
+            chunk_text = chunk.text.lower()
+            if any(word in chunk_text for word in ['pizza', 'burger', 'pasta']):  # Example items
+                return chunk.text
+                
+        return None
+    
+    def _extract_inventory_item(self, text: str, doc) -> Optional[str]:
+        """Extract inventory item from text."""
+        # First check for menu items
+        item = self._extract_menu_item(text, doc)
+        if item:
+            return item
+            
+        # Then check for raw materials
+        return self._extract_material(text, doc)
+    
+    def _extract_metric(self, text: str, doc) -> str:
+        """Extract metric from analytics query."""
+        text_lower = text.lower()
+        for metric in self.analytics_metrics:
+            if metric in text_lower:
+                return metric
+        return 'sales'  # Default metric
+    
+    def _extract_time_period(self, text: str) -> str:
+        """Extract time period from text."""
+        text_lower = text.lower()
+        for period in self.time_periods:
+            if period in text_lower:
+                return period
+        return 'this week'  # Default period
+    
+    def _extract_material(self, text: str, doc) -> Optional[str]:
+        """Extract raw material from text."""
+        # Simple implementation - can be enhanced with a materials database
+        materials = ['flour', 'sugar', 'rice', 'oil', 'spices', 'vegetables', 'meat']
+        text_lower = text.lower()
+        for material in materials:
+            if material in text_lower:
+                return material
+                
+        # Try to find a noun that's not a stop word
+        for token in doc:
+            if token.pos_ == 'NOUN' and not token.is_stop:
+                return token.text
+                
+        return None
+    
+    def optimize_prompt(self, text: str) -> OptimizationResult:
+        """
+        Optimize a natural language query into a structured prompt.
+        Returns an OptimizationResult object with the results.
+        """
+        start_time = perf_counter()
+        
+        # Classify intent
+        intent, confidence = self.classify_intent(text)
+        
+        # Extract entities
+        entities, missing_entities = self.extract_entities(text, intent)
+        
+        # Get the appropriate template
+        template = self.templates.get(intent, {})
+        template_str = template.get('template', '{query}')
+        
+        # Prepare context with defaults
+        context = {
+            'query': text,
+            'intent': intent,
+            **template.get('defaults', {}),
+            **{k: v for k, v in entities.items() if v is not None}
+        }
+        
+        # Check for missing required fields
+        required_fields = template.get('required', [])
+        missing_required = [f for f in required_fields if f not in context or context[f] is None]
+        
+        # Mark missing entities for user input
+        needs_user_input = bool(missing_required)
+        
+        # Generate the optimized prompt
+        try:
+            optimized_prompt = template_str.format(**context)
+        except KeyError as e:
+            logger.warning(f"Missing key in template: {e}")
+            optimized_prompt = text  # Fallback to original text
+        
+        # Record analytics
+        processing_time = perf_counter() - start_time
+        self.analytics['total_optimizations'] += 1
+        self.analytics['intent_distribution'][intent] += 1
+        self.analytics['confidence_scores'].append(confidence)
+        self.analytics['response_times'].append(processing_time)
+        
+        # Update missing entities tracking
+        for entity in missing_required:
+            self.analytics['missing_entities'][entity] += 1
+        
+        # Create and return the result
+        return OptimizationResult(
+            original_query=text,
+            optimized_prompt=optimized_prompt,
+            intent=intent,
+            confidence=confidence,
+            entities=context,
+            entity_details={
+                k: {
+                    'value': v,
+                    'needs_user_input': k in missing_required,
+                    'source': 'extracted' if k in entities else 'default'
+                }
+                for k, v in context.items()
+            },
+            needs_user_input=needs_user_input,
+            missing_entities=missing_required
+        )
+    
+    def optimize_with_entities(self, text: str, entities: Dict[str, Any]) -> OptimizationResult:
+        """
+        Optimize a prompt with pre-filled entity values.
+        Useful for when the user provides missing information.
+        """
+        # Get the base optimization result
+        result = self.optimize_prompt(text)
+        
+        # Update with user-provided entities
+        for key, value in entities.items():
+            if value:  # Only update with non-empty values
+                result.entities[key] = value
+                if key in result.entity_details:
+                    result.entity_details[key].update({
+                        'value': value,
+                        'needs_user_input': False,
+                        'source': 'user',
+                        'is_corrected': True
+                    })
+        
+        # Re-optimize with the updated entities
+        return self.optimize_prompt_with_entities(text, result.entities, result.intent)
+    
+    def optimize_prompt_with_entities(self, text: str, entities: Dict[str, Any], 
+                                    intent: str = None) -> OptimizationResult:
+        """
+        Optimize a prompt with pre-extracted entities and optional intent.
+        This is more efficient than reprocessing from scratch.
+        """
+        if intent is None:
+            intent, _ = self.classify_intent(text)
+            
+        template = self.templates.get(intent, {})
+        template_str = template.get('template', '{query}')
+        
+        # Prepare context with defaults and provided entities
+        context = {
+            'query': text,
+            'intent': intent,
+            **template.get('defaults', {}),
+            **{k: v for k, v in entities.items() if v is not None}
+        }
+        
+        # Check for missing required fields
+        required_fields = template.get('required', [])
+        missing_required = [f for f in required_fields if f not in context or context[f] is None]
+        
+        # Generate the optimized prompt
+        try:
+            optimized_prompt = template_str.format(**context)
+        except KeyError as e:
+            logger.warning(f"Missing key in template: {e}")
+            optimized_prompt = text  # Fallback to original text
+        
+        # Create and return the result
+        return OptimizationResult(
+            original_query=text,
+            optimized_prompt=optimized_prompt,
+            intent=intent,
+            confidence=1.0,  # Higher confidence when using pre-validated entities
+            entities=context,
+            entity_details={
+                k: {
+                    'value': v,
+                    'needs_user_input': k in missing_required,
+                    'source': 'user' if k in entities else 'default'
+                }
+                for k, v in context.items()
+            },
+            needs_user_input=bool(missing_required),
+            missing_entities=missing_required
+        )
+    
+    def __init__(self, nlp=None, templates=None):
+        # Load models and data with caching
+        self.nlp = nlp or load_nlp()
+        self.templates = templates or load_templates()
+        
+        # Initialize in-memory storage with reasonable defaults
+        self.optimization_history = deque(maxlen=100)  # Increased history size
+        self.feedback_history = []
         self.analytics = {
             'total_optimizations': 0,
-            'intent_distribution': {},
+            'intent_distribution': defaultdict(int),
             'confidence_scores': [],
             'success_rate': 0,
-            'feedback': {'positive': 0, 'negative': 0, 'total': 0}
+            'feedback': {'positive': 0, 'negative': 0, 'total': 0},
+            'response_times': [],
+            'missing_entities': defaultdict(int)
         }
-        # Define intent keywords with weights
+        
+        # Intent keywords with weights (optimized for quick lookup)
         self.intent_keywords = {
-            'menu': {
-                'add': 1.0, 'new': 0.9, 'item': 0.8, 'dish': 0.9, 'food': 0.8, 
-                'menu': 0.7, 'category': 0.6, 'price': 0.7, 'update': 0.8, 'remove': 0.7
-            },
-            'inventory': {
-                'stock': 1.0, 'inventory': 0.9, 'check': 0.8, 'level': 0.7, 
-                'quantity': 0.8, 'available': 0.7, 'out of stock': 0.9, 'low': 0.6
-            },
-            'analytics': {
-                'sales': 1.0, 'revenue': 0.9, 'analytics': 0.8, 'report': 0.8, 
-                'insight': 0.7, 'trend': 0.7, 'metric': 0.6, 'stat': 0.6, 'graph': 0.5
-            },
-            'support': {
-                'help': 1.0, 'problem': 0.9, 'issue': 0.9, 'ticket': 0.8, 
-                'error': 0.9, 'not working': 0.8, 'question': 0.7, 'assist': 0.7
-            },
-            'raw_material': {
-                'ingredient': 1.0, 'raw': 0.9, 'material': 0.9, 'supply': 0.8, 
-                'purchase': 0.7, 'order': 0.7, 'stock': 0.6
-            }
+            'menu': {'add': 1.0, 'new': 0.9, 'item': 0.8, 'dish': 0.9, 'menu': 0.7},
+            'inventory': {'stock': 1.0, 'inventory': 0.9, 'check': 0.8, 'level': 0.7},
+            'analytics': {'sales': 1.0, 'revenue': 0.9, 'report': 0.8, 'insight': 0.7},
+            'support': {'help': 1.0, 'problem': 0.9, 'issue': 0.9, 'ticket': 0.8},
+            'raw_material': {'ingredient': 1.0, 'raw': 0.9, 'material': 0.9, 'supply': 0.8}
         }
         
-        # Common menu items and categories with variations
-        self.menu_items = {
-            'biryani': {'category': 'main course', 'variations': ['chicken biryani', 'veg biryani', 'mutton biryani']},
-            'paneer': {'category': 'main course', 'variations': ['paneer tikka', 'paneer butter masala', 'kadai paneer']},
-            'butter chicken': {'category': 'main course'},
-            'naan': {'category': 'bread', 'variations': ['butter naan', 'garlic naan']},
-            'gulab jamun': {'category': 'dessert'},
-            'momos': {'category': 'starter', 'variations': ['veg momos', 'chicken momos']},
-            # Add more items as needed
-        }
+        # Menu items and categories (moved to module level for better caching)
+        self.menu_items = MENU_ITEMS
+        self.menu_categories = MENU_CATEGORIES
         
-        # Menu categories with common variations
-        self.menu_categories = {
-            'appetizer': ['starter', 'snack', 'finger food'],
-            'main course': ['main', 'thali', 'curry', 'gravy'],
-            'dessert': ['sweet', 'mithai'],
-            'beverage': ['drink', 'juice', 'soda', 'mocktail'],
-            'soup': ['soup', 'stew', 'broth'],
-            'salad': ['salad', 'raita'],
-            'bread': ['roti', 'naan', 'paratha', 'kulcha']
-        }
+        # Pre-compile regex patterns
+        self.price_re = PRICE_RE
         
         # Common metrics for analytics
         self.analytics_metrics = {
@@ -110,11 +463,12 @@ class PetPoojaOptimizer:
         # Common time periods
         self.time_periods = {
             'today', 'yesterday', 'week', 'month', 'year',
-            'daily', 'weekly', 'monthly', 'yearly',
-            'last week', 'last month', 'last year'
+            'this week', 'last week', 'this month', 'last month',
+            'this year', 'last year', 'quarter', 'q1', 'q2', 'q3', 'q4',
+            'daily', 'weekly', 'monthly', 'yearly'
         }
         
-        # Define prompt templates with placeholders
+        # Define prompt templates with placeholders and requirements
         self.templates = {
             'menu': {
                 'template': "Add new {item} to {category} with price {price}",

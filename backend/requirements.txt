@@ -7,6 +7,15 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-dotenv==1.0.0
 
+# NLP and Text Processing
+spacy==3.7.2
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.12.2
+
+# Web Framework
+streamlit==1.29.0
+
 # Testing
 pytest==7.4.2
 pytest-cov==4.1.0

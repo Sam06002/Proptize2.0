@@ -1,4 +1,5 @@
 {
+  "default": "Process request with intent '{intent}'. Details: {entities}",
   "menu": "Add new item to base menu: {item} with price {price} and category {category}",
   "inventory": "Check inventory levels for {item}",
   "analytics": "Provide analytics insights for {period} {metric} data",
