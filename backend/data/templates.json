@@ -1,0 +1,7 @@
+{
+  "menu": "Add new item to base menu: {item} with price {price} and category {category}",
+  "inventory": "Check inventory levels for {item}",
+  "analytics": "Provide analytics insights for {period} {metric} data",
+  "support": "Raise support ticket for {issue_description}",
+  "raw_material": "Add new raw material: {material_name} with unit {unit_type}"
+}

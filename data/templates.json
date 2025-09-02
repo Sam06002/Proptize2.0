@@ -1,0 +1,42 @@
+{
+  "menu": {
+    "description": "Menu-related queries",
+    "templates": [
+      "As a restaurant menu expert, analyze and optimize this query: {query}",
+      "For menu management, process this request: {query}",
+      "Handle this menu-related query: {query}"
+    ]
+  },
+  "inventory": {
+    "description": "Inventory management queries",
+    "templates": [
+      "As an inventory management system, process: {query}",
+      "For inventory tracking, handle this request: {query}",
+      "Inventory management query: {query}"
+    ]
+  },
+  "analytics": {
+    "description": "Analytics and reporting queries",
+    "templates": [
+      "Generate analytics report for: {query}",
+      "As a data analyst, process this query: {query}",
+      "Analytics request: {query}"
+    ]
+  },
+  "support": {
+    "description": "Customer support queries",
+    "templates": [
+      "Customer support request: {query}",
+      "Handle this support ticket: {query}",
+      "As a support agent, respond to: {query}"
+    ]
+  },
+  "raw_material": {
+    "description": "Raw material and supply chain queries",
+    "templates": [
+      "Raw material management for: {query}",
+      "Process this supply chain query: {query}",
+      "Handling raw material request: {query}"
+    ]
+  }
+}
