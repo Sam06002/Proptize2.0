@@ -154,7 +154,7 @@ def main():
                         st.session_state.get('user_entities', {})
                     )
                     st.session_state.user_entities = {}
-                    st.experimental_rerun()
+                    st.rerun()
         
         # Display results if available
         if st.session_state.get('optimized_result'):
