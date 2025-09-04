@@ -1,9 +1,18 @@
 import streamlit as st
 import json
 import os
+import spacy
 from typing import Dict, Any, List, Optional
 from optimizer import PetPoojaOptimizer
 from datetime import datetime
+
+# Load spaCy model with fallback download
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    import spacy.cli
+    spacy.cli.download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 # Set page config
 st.set_page_config(
