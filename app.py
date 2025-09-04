@@ -6,8 +6,13 @@ from typing import Dict, Any, List, Optional
 from optimizer import PetPoojaOptimizer
 from datetime import datetime
 
-# Load spaCy model
-nlp = spacy.load("en_core_web_sm")
+# Load spaCy model with runtime download fallback
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    from spacy.cli import download
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 # Set page config
 st.set_page_config(
