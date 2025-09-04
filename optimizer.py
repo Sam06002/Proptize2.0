@@ -38,7 +38,8 @@ class PetPoojaOptimizer:
                                 Defaults to "data/templates.json".
         """
         self.templates = self._load_templates(templates_path)
-        self.nlp = spacy.load("en_core_web_sm")
+        from utils import get_spacy_model
+        self.nlp = get_spacy_model()
         
         # Initialize analytics tracking
         self.analytics = {

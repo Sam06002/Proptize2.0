@@ -18,6 +18,25 @@ var/
 wheels/
 *.egg-info/
 .installed.cfg
+
+# Virtual Environment
+venv/
+ENV/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local development
+.env
+*.log
 *.egg
 
 # Virtual Environment

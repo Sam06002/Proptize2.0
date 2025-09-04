@@ -6,13 +6,10 @@ from typing import Dict, Any, List, Optional
 from optimizer import PetPoojaOptimizer
 from datetime import datetime
 
+from utils import get_spacy_model
+
 # Load spaCy model with runtime download fallback
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+nlp = get_spacy_model()
 
 # Set page config
 st.set_page_config(
@@ -86,17 +83,28 @@ def display_entity_badges(entities: Dict[str, Any]) -> None:
         st.info("No entities extracted.")
         return
     
-    cols = st.columns(4)
-    for i, (key, value) in enumerate(entities.items()):
-        with cols[i % 4]:
-            st.markdown(f'<span class="entity-badge">{key}: {value}</span>', unsafe_allow_html=True)
-
-def display_missing_entities_form(missing_entities: List[str], intent: str) -> Dict[str, Any]:
-    """Display a form for user to provide missing entities."""
-    if not missing_entities:
-        return {}
+    # Create a table with two columns: Entity Type and Value
+    table_data = []
+    for key, value in entities.items():
+        table_data.append({"Entity Type": key.replace("_", " ").title(), "Value": str(value)})
     
-    st.warning("Some required information is missing. Please provide the following details:")
+    # Display the table using st.data_editor in view mode
+    if table_data:
+        st.data_editor(
+            data=table_data,
+            column_config={
+                "Entity Type": "Entity Type",
+                "Value": "Value"
+            },
+            hide_index=True,
+            use_container_width=True,
+            disabled=True,
+            key="entities_table"
+        )
+
+def display_missing_entities_form(missing_entities: List[str], intent: str) -> None:
+    """Display a form for user to provide missing entities."""
+    st.warning("Some entities couldn't be extracted. Please provide the missing information:")
     user_entities = {}
     
     # Create a form for missing entities
@@ -104,14 +112,23 @@ def display_missing_entities_form(missing_entities: List[str], intent: str) -> D
         for entity in missing_entities:
             user_entities[entity] = st.text_input(
                 f"{entity.replace('_', ' ').title()}",
-                placeholder=f"Enter {entity.replace('_', ' ')}"
+                placeholder=f"Enter {entity.replace('_', ' ')}",
+                key=f"missing_entity_{entity}"  # Add unique key for each input
             )
         
         submitted = st.form_submit_button("Re-optimize with provided details")
         if submitted:
-            return {k: v for k, v in user_entities.items() if v}
-    
-    return {}
+            # Update the user_entities in session state
+            st.session_state.user_entities.update(
+                {k: v for k, v in user_entities.items() if v}
+            )
+            # Re-run the optimization with the new entities
+            if st.session_state.get('current_query'):
+                st.session_state.optimized_result = st.session_state.optimizer.optimize_prompt(
+                    st.session_state.current_query,
+                    st.session_state.user_entities
+                )
+            st.rerun()
 
 def main():
     """Main Streamlit application."""
@@ -123,7 +140,7 @@ def main():
         st.session_state.optimizer = load_optimizer()
     if 'optimized_result' not in st.session_state:
         st.session_state.optimized_result = None
-    if 'user_entities' not in st.session_state:
+    if 'user_entities' not in st.session_state or st.session_state.user_entities is None:
         st.session_state.user_entities = {}
     if 'history' not in st.session_state:
         st.session_state.history = []
@@ -149,8 +166,13 @@ def main():
         query = st.text_area(
             "Enter your query:",
             value=st.session_state.get('sample_query', ''),
-            placeholder="e.g., Add butter chicken to the menu for ₹350"
+            placeholder="e.g., Add butter chicken to the menu for ₹350",
+            key="query_input"
         )
+        
+        # Store the current query in session state
+        if query.strip():
+            st.session_state.current_query = query
         
         # Optimize button
         if st.button("Optimize Prompt"):
@@ -158,6 +180,7 @@ def main():
                 st.error("Please enter a query to optimize.")
             else:
                 with st.spinner("Optimizing your prompt..."):
+                    st.session_state.current_query = query
                     st.session_state.optimized_result = st.session_state.optimizer.optimize_prompt(
                         query, 
                         st.session_state.get('user_entities', {})
@@ -190,7 +213,7 @@ def main():
             
             # Show missing entities form if any
             if result['missing_entities']:
-                st.session_state.user_entities = display_missing_entities_form(
+                display_missing_entities_form(
                     result['missing_entities'], 
                     result['intent']
                 )
